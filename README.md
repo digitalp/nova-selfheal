@@ -218,9 +218,10 @@ The dry-run output will appear in logs and in the Telegram reject message. Commo
 
 ---
 
-## Credits
+## Contributors
 
-**Idea & Co-Author:** Tangu Penn
+- **Tangu Penn** — Idea & co-author
+- **Claude (Anthropic)** — Co-author & implementation
 
 ---
 
