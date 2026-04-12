@@ -8,10 +8,11 @@ from typing import TYPE_CHECKING, Callable, Awaitable
 import structlog
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
-from telegram.ext import Application, CallbackQueryHandler, ContextTypes
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 if TYPE_CHECKING:
     from nova_selfheal.config import Settings
+    from nova_selfheal.event_store import EventStore
     from nova_selfheal.models import NovaError, PendingFix
 
 _LOGGER = structlog.get_logger(__name__)
@@ -27,6 +28,7 @@ class TelegramApprovalBot:
     - Handles approval callback → calls on_approve(fix_id)
     - Handles rejection callback → calls on_reject(fix_id)
     - Auto-rejects pending fixes after approval_timeout_seconds
+    - Responds to /status /pending /config /pause /resume /logs commands
     """
 
     def __init__(
@@ -34,13 +36,22 @@ class TelegramApprovalBot:
         settings: "Settings",
         on_approve: Callable[[str], Awaitable[None]],
         on_reject: Callable[[str], Awaitable[None]],
+        event_store: "EventStore | None" = None,
+        pending_fixes: "dict[str, PendingFix] | None" = None,
+        get_paused: "Callable[[], bool] | None" = None,
+        set_paused: "Callable[[bool], None] | None" = None,
     ) -> None:
         self._settings = settings
         self._on_approve = on_approve
         self._on_reject = on_reject
+        self._event_store = event_store
+        self._pending_fixes = pending_fixes if pending_fixes is not None else {}
+        self._get_paused = get_paused or (lambda: False)
+        self._set_paused = set_paused or (lambda v: None)
         self._pending: dict[str, "PendingFix"] = {}
         self._app: Application | None = None
         self._timeout_task: asyncio.Task | None = None
+        self._start_time = time.monotonic()
 
     async def start(self) -> None:
         self._app = (
@@ -49,6 +60,13 @@ class TelegramApprovalBot:
             .build()
         )
         self._app.add_handler(CallbackQueryHandler(self._handle_callback))
+        self._app.add_handler(CommandHandler("status",  self._cmd_status))
+        self._app.add_handler(CommandHandler("pending", self._cmd_pending))
+        self._app.add_handler(CommandHandler("config",  self._cmd_config))
+        self._app.add_handler(CommandHandler("pause",   self._cmd_pause))
+        self._app.add_handler(CommandHandler("resume",  self._cmd_resume))
+        self._app.add_handler(CommandHandler("logs",    self._cmd_logs))
+        self._app.add_handler(CommandHandler("help",    self._cmd_help))
         await self._app.initialize()
         await self._app.start()
         await self._app.updater.start_polling(drop_pending_updates=True)
@@ -69,6 +87,8 @@ class TelegramApprovalBot:
             await self._app.stop()
             await self._app.shutdown()
         _LOGGER.info("telegram_bot.stopped")
+
+    # ── Fix proposal messages ─────────────────────────────────────────────────
 
     async def send_fix_proposal(self, fix: "PendingFix") -> None:
         """Send error details + diff to user with Approve/Reject buttons."""
@@ -101,7 +121,6 @@ class TelegramApprovalBot:
                 reply_markup=keyboard,
             )
         elif fix.has_diff:
-            # Diff too long — send as file attachment
             text = header + "\n_Diff attached as file \\(too long for inline\\)_\n\n_Timeout: 30 min_"
             await bot.send_message(
                 chat_id=self._settings.telegram_chat_id,
@@ -116,7 +135,6 @@ class TelegramApprovalBot:
                 reply_markup=keyboard,
             )
         else:
-            # No diff — analysis only
             text = (
                 header +
                 "\n⚠️ _Claude could not produce a safe diff \\— analysis only\\._\n"
@@ -161,7 +179,139 @@ class TelegramApprovalBot:
             parse_mode=ParseMode.MARKDOWN_V2,
         )
 
+    # ── Command handlers ──────────────────────────────────────────────────────
+
+    async def _cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_authorized(update):
+            return
+        text = (
+            "🛡 *Nova Self\\-Heal Commands*\n\n"
+            "/status — service status and stats\n"
+            "/pending — list pending fixes awaiting approval\n"
+            "/config — show current configuration\n"
+            "/logs — last 10 pipeline events\n"
+            "/pause — stop processing new errors\n"
+            "/resume — resume processing errors\n"
+            "/help — show this message"
+        )
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2)
+
+    async def _cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_authorized(update):
+            return
+        uptime_s = int(time.monotonic() - self._start_time)
+        paused = self._get_paused()
+        stats = self._event_store.get_stats() if self._event_store else {}
+
+        h, m = divmod(uptime_s // 60, 60)
+        uptime_str = f"{h}h {m}m" if h else f"{m}m {uptime_s % 60}s"
+
+        status_icon = "⏸" if paused else "✅"
+        status_label = "Paused" if paused else "Running"
+
+        text = (
+            f"🛡 *Nova Self\\-Heal Status*\n\n"
+            f"{status_icon} *Status:* {_esc(status_label)}\n"
+            f"⏱ *Uptime:* {_esc(uptime_str)}\n"
+            f"👁 *Watching:* `{_esc(self._settings.watch_service)}`\n"
+            f"⏳ *Pending fixes:* {len(self._pending)}\n\n"
+            f"📊 *Totals:*\n"
+            f"  Errors detected: {stats.get('errors_detected', '—')}\n"
+            f"  Patches applied: {stats.get('patches_applied', '—')}\n"
+            f"  Fixes rejected: {stats.get('fixes_rejected', '—')}"
+        )
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2)
+
+    async def _cmd_pending(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_authorized(update):
+            return
+        if not self._pending:
+            await update.message.reply_text("✅ No pending fixes\\.", parse_mode=ParseMode.MARKDOWN_V2)
+            return
+        lines = [f"⏳ *{len(self._pending)} pending fix(es):*\n"]
+        for fix_id, fix in self._pending.items():
+            age_m = int((time.monotonic() - fix.created_at) / 60)
+            lines.append(
+                f"• `{_esc(fix.error.event)}` \\({_esc(fix.error.exc_type or '?')}\\) "
+                f"— {age_m}m ago"
+            )
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2)
+
+    async def _cmd_config(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_authorized(update):
+            return
+        s = self._settings
+        token = s.telegram_bot_token
+        masked = token[:6] + "\\.\\.\\." + token[-4:] if len(token) > 10 else "\\*\\*\\*"
+        text = (
+            f"⚙️ *Configuration*\n\n"
+            f"*Watch service:* `{_esc(s.watch_service)}`\n"
+            f"*Nova path:* `{_esc(str(s.nova_path))}`\n"
+            f"*Approval timeout:* {s.approval_timeout_seconds}s\n"
+            f"*Dedup window:* {s.dedup_window_seconds}s\n"
+            f"*Claude timeout:* {s.claude_timeout_seconds}s\n"
+            f"*API port:* {s.api_port}\n"
+            f"*Log level:* {_esc(s.log_level)}\n"
+            f"*Bot token:* `{masked}`\n"
+            f"*Chat ID:* `{s.telegram_chat_id}`"
+        )
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2)
+
+    async def _cmd_pause(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_authorized(update):
+            return
+        self._set_paused(True)
+        _LOGGER.info("telegram_bot.paused_via_command")
+        await update.message.reply_text(
+            "⏸ *Self\\-heal paused*\\. New errors will be ignored until you send /resume\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+
+    async def _cmd_resume(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_authorized(update):
+            return
+        self._set_paused(False)
+        _LOGGER.info("telegram_bot.resumed_via_command")
+        await update.message.reply_text(
+            "▶️ *Self\\-heal resumed*\\. Monitoring errors again\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+
+    async def _cmd_logs(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_authorized(update):
+            return
+        if not self._event_store:
+            await update.message.reply_text("_No event store available\\._", parse_mode=ParseMode.MARKDOWN_V2)
+            return
+        events = self._event_store.get_recent(limit=10)
+        if not events:
+            await update.message.reply_text("_No events yet\\._", parse_mode=ParseMode.MARKDOWN_V2)
+            return
+        from nova_selfheal.event_store import (
+            EVT_ERROR_DETECTED, EVT_FIX_PROPOSED, EVT_APPLY_OK,
+            EVT_APPLY_FAILED, EVT_APPROVED, EVT_REJECTED, EVT_AUTO_REJECTED,
+        )
+        ICONS = {
+            EVT_ERROR_DETECTED: "🔴", EVT_FIX_PROPOSED: "🔧",
+            EVT_APPLY_OK: "✅", EVT_APPLY_FAILED: "💥",
+            EVT_APPROVED: "✅", EVT_REJECTED: "❌", EVT_AUTO_REJECTED: "⏱",
+        }
+        lines = ["📋 *Last 10 events:*\n"]
+        for e in events:
+            icon = ICONS.get(e["event_type"], "•")
+            ts = e.get("ts_iso", "")[:16].replace("T", " ") if e.get("ts_iso") else "—"
+            label = e["event_type"].replace("_", "\\_")
+            detail = _esc((e.get("log_event") or e.get("service") or "")[:40])
+            lines.append(f"{icon} `{_esc(ts)}` {label} {detail}")
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2)
+
     # ── Internals ─────────────────────────────────────────────────────────────
+
+    def _is_authorized(self, update: Update) -> bool:
+        """Only respond to messages from the configured chat ID."""
+        if not update.message:
+            return False
+        return update.message.chat_id == self._settings.telegram_chat_id
 
     async def _handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
@@ -203,7 +353,7 @@ class TelegramApprovalBot:
             fix = self._pending.pop(fix_id, None)
             if fix:
                 _LOGGER.info("telegram_bot.auto_rejected", fix_id=fix_id, event=fix.error.event)
-                await self._on_reject(fix_id)
+                await self._on_reject(fix_id, auto=True)
                 assert self._app
                 await self._app.bot.send_message(
                     chat_id=self._settings.telegram_chat_id,

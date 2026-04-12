@@ -60,6 +60,9 @@ async def run(settings: Settings) -> None:
     agent = ClaudeAgent(settings.claude_work_dir, settings)
     applier = PatchApplier(settings.nova_path, settings.watch_service)
 
+    # Pause state — toggled via /pause and /resume Telegram commands
+    _paused: list[bool] = [False]  # list so closures can mutate it
+
     # ── Approval callbacks ────────────────────────────────────────────────────
 
     async def on_approve(fix_id: str) -> None:
@@ -95,7 +98,15 @@ async def run(settings: Settings) -> None:
 
     # ── Bot + API server ──────────────────────────────────────────────────────
 
-    bot = TelegramApprovalBot(settings, on_approve=on_approve, on_reject=on_reject)
+    bot = TelegramApprovalBot(
+        settings,
+        on_approve=on_approve,
+        on_reject=on_reject,
+        event_store=events,
+        pending_fixes=_pending_fixes,
+        get_paused=lambda: _paused[0],
+        set_paused=lambda v: _paused.__setitem__(0, v),
+    )
     watcher = JournalWatcher(settings.watch_service, queue, settings)
 
     api_app = create_app(settings, events, _pending_fixes, on_approve, on_reject)
@@ -111,6 +122,12 @@ async def run(settings: Settings) -> None:
             error: NovaError = await queue.get()
 
             _LOGGER.info("selfheal.error_received", event=error.event, exc_type=error.exc_type)
+
+            # Respect pause state
+            if _paused[0]:
+                _LOGGER.info("selfheal.paused_skipping", event=error.event)
+                continue
+
             events.record(
                 EVT_ERROR_DETECTED,
                 service=settings.watch_service,
