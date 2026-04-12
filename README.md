@@ -84,6 +84,8 @@ All configuration lives in `/opt/nova-selfheal/.env`:
 | `APPROVAL_TIMEOUT_SECONDS` | `1800` | Auto-reject pending fixes after this many seconds (default: 30 min) |
 | `DEDUP_WINDOW_SECONDS` | `1800` | Suppress duplicate `(event, exc_type)` pairs within this window |
 | `CLAUDE_TIMEOUT_SECONDS` | `120` | Timeout for Claude CLI subprocess |
+| `API_HOST` | `0.0.0.0` | Host for the built-in HTTP API server |
+| `API_PORT` | `7779` | Port for the built-in HTTP API server (used by the Nova admin UI) |
 | `LOG_LEVEL` | `INFO` | Logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
 
 After editing `.env`:

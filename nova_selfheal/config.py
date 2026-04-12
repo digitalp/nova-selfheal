@@ -24,6 +24,10 @@ class Settings(BaseSettings):
     # ── Storage ───────────────────────────────────────────────────────────────
     db_path: Path = Path("/opt/nova-selfheal/dedup.db")
 
+    # ── API server ────────────────────────────────────────────────────────────
+    api_host: str = "0.0.0.0"
+    api_port: int = 7779
+
     # ── Logging ───────────────────────────────────────────────────────────────
     log_level: str = "INFO"
 

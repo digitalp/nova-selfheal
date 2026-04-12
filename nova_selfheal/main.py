@@ -6,10 +6,18 @@ import uuid
 
 import structlog
 
+from nova_selfheal.api_server import ApiServer, create_app
 from nova_selfheal.config import Settings
 from nova_selfheal.context_builder import ContextBuilder
 from nova_selfheal.claude_agent import ClaudeAgent
 from nova_selfheal.deduplicator import ErrorDeduplicator
+from nova_selfheal.event_store import (
+    EventStore,
+    EVT_ERROR_DETECTED, EVT_DEDUPLICATED, EVT_NO_SOURCE, EVT_CLAUDE_FAILED,
+    EVT_FIX_PROPOSED, EVT_ANALYSIS_ONLY, EVT_APPROVED, EVT_REJECTED,
+    EVT_AUTO_REJECTED, EVT_APPLY_OK, EVT_APPLY_FAILED,
+    EVT_RESTART_OK, EVT_RESTART_FAILED,
+)
 from nova_selfheal.models import NovaError, PendingFix
 from nova_selfheal.patch_applier import PatchApplier
 from nova_selfheal.patch_extractor import extract_diff, extract_summary, validate_diff
@@ -46,6 +54,8 @@ async def run(settings: Settings) -> None:
     dedup = ErrorDeduplicator(settings.db_path, settings.dedup_window_seconds)
     dedup.setup()
 
+    events = EventStore(settings.db_path.parent / "heal_events.db")
+
     builder = ContextBuilder(settings.nova_path)
     agent = ClaudeAgent(settings.claude_work_dir, settings)
     applier = PatchApplier(settings.nova_path, settings.watch_service)
@@ -56,40 +66,62 @@ async def run(settings: Settings) -> None:
         fix = _pending_fixes.pop(fix_id, None)
         if fix is None:
             return
+        events.record(EVT_APPROVED, fix_id=fix_id, log_event=fix.error.event)
         if not fix.has_diff:
             await bot.send_result(fix_id, False, "No diff to apply.")
             return
 
         ok, msg = await applier.apply(fix.diff)
         if ok:
+            events.record(EVT_APPLY_OK, fix_id=fix_id, log_event=fix.error.event, message=msg)
             restart_ok, restart_msg = await applier.restart_service()
+            evt = EVT_RESTART_OK if restart_ok else EVT_RESTART_FAILED
+            events.record(evt, fix_id=fix_id, service=settings.watch_service, message=restart_msg)
             full_msg = f"Patch applied.\n{restart_msg}"
             await bot.send_result(fix_id, restart_ok, full_msg)
         else:
+            events.record(EVT_APPLY_FAILED, fix_id=fix_id, log_event=fix.error.event, message=msg)
             await bot.send_result(fix_id, False, msg)
 
-    async def on_reject(fix_id: str) -> None:
-        _pending_fixes.pop(fix_id, None)
-        _LOGGER.info("selfheal.fix_rejected", fix_id=fix_id)
+    async def on_reject(fix_id: str, auto: bool = False) -> None:
+        fix = _pending_fixes.pop(fix_id, None)
+        log_event = fix.error.event if fix else ""
+        events.record(
+            EVT_AUTO_REJECTED if auto else EVT_REJECTED,
+            fix_id=fix_id,
+            log_event=log_event,
+        )
+        _LOGGER.info("selfheal.fix_rejected", fix_id=fix_id, auto=auto)
 
-    # ── Bot ───────────────────────────────────────────────────────────────────
+    # ── Bot + API server ──────────────────────────────────────────────────────
 
     bot = TelegramApprovalBot(settings, on_approve=on_approve, on_reject=on_reject)
     watcher = JournalWatcher(settings.watch_service, queue, settings)
 
+    api_app = create_app(settings, events, _pending_fixes, on_approve, on_reject)
+    api = ApiServer(api_app, host=settings.api_host, port=settings.api_port)
+
     await bot.start()
     await watcher.start()
-    _LOGGER.info("selfheal.started", service=settings.watch_service)
+    await api.start()
+    _LOGGER.info("selfheal.started", service=settings.watch_service, api_port=settings.api_port)
 
     try:
         while True:
             error: NovaError = await queue.get()
 
             _LOGGER.info("selfheal.error_received", event=error.event, exc_type=error.exc_type)
+            events.record(
+                EVT_ERROR_DETECTED,
+                service=settings.watch_service,
+                log_event=error.event,
+                exc_type=error.exc_type,
+            )
 
             # Deduplicate
             if dedup.is_duplicate(error):
                 _LOGGER.info("selfheal.deduplicated", event=error.event)
+                events.record(EVT_DEDUPLICATED, log_event=error.event, exc_type=error.exc_type)
                 continue
             dedup.record(error)
 
@@ -97,6 +129,7 @@ async def run(settings: Settings) -> None:
             source_file = builder.resolve_source_file(error.logger)
             if source_file is None:
                 _LOGGER.warning("selfheal.no_source_file", logger=error.logger)
+                events.record(EVT_NO_SOURCE, log_event=error.event, message=error.logger)
                 await bot.send_analysis_only(
                     error,
                     f"Could not resolve source file for logger `{error.logger}`. Manual investigation needed."
@@ -109,6 +142,7 @@ async def run(settings: Settings) -> None:
                 claude_output = await agent.generate_fix(error, error_context)
             except RuntimeError as exc:
                 _LOGGER.error("selfheal.claude_failed", exc=repr(exc))
+                events.record(EVT_CLAUDE_FAILED, log_event=error.event, message=repr(exc))
                 await bot.send_analysis_only(error, f"Claude invocation failed: {exc}")
                 continue
 
@@ -118,7 +152,7 @@ async def run(settings: Settings) -> None:
 
             if diff and not validate_diff(diff, settings.nova_path):
                 _LOGGER.warning("selfheal.unsafe_diff", event=error.event)
-                diff = None  # Treat as analysis-only
+                diff = None
 
             fix_id = str(uuid.uuid4())
             fix = PendingFix(
@@ -132,14 +166,32 @@ async def run(settings: Settings) -> None:
             _pending_fixes[fix_id] = fix
 
             if fix.has_diff:
+                events.record(
+                    EVT_FIX_PROPOSED,
+                    fix_id=fix_id,
+                    log_event=error.event,
+                    exc_type=error.exc_type,
+                    source_file=fix.source_file,
+                    summary=summary,
+                    diff=diff or "",
+                )
                 await bot.send_fix_proposal(fix)
             else:
                 _LOGGER.info("selfheal.no_diff_analysis_only", event=error.event)
+                events.record(
+                    EVT_ANALYSIS_ONLY,
+                    fix_id=fix_id,
+                    log_event=error.event,
+                    exc_type=error.exc_type,
+                    source_file=fix.source_file,
+                    summary=summary,
+                )
                 await bot.send_analysis_only(error, summary)
 
     except asyncio.CancelledError:
         _LOGGER.info("selfheal.stopping")
     finally:
+        await api.stop()
         await watcher.stop()
         await bot.stop()
         dedup.close()
