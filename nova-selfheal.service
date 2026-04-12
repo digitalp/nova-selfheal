@@ -1,0 +1,26 @@
+[Unit]
+Description=Nova Self-Heal Agent
+Documentation=https://github.com/digitalp/nova-selfheal
+After=network-online.target systemd-journald.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/opt/nova-selfheal/.venv/bin/python -m nova_selfheal.main
+WorkingDirectory=/opt/nova-selfheal
+EnvironmentFile=/opt/nova-selfheal/.env
+Restart=on-failure
+RestartSec=10s
+RestartPreventExitStatus=1
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nova-selfheal
+
+TimeoutStartSec=30s
+TimeoutStopSec=15s
+
+[Install]
+WantedBy=multi-user.target
