@@ -13,9 +13,11 @@ if TYPE_CHECKING:
 
 _LOGGER = structlog.get_logger(__name__)
 
-# journald PRIORITY values: 0=EMERG 1=ALERT 2=CRIT 3=ERR 4=WARNING ...
-# We only forward ERR (3) and above (lower number = more severe)
-_MAX_PRIORITY = 3
+# journald PRIORITY values: 0=EMERG 1=ALERT 2=CRIT 3=ERR 4=WARNING 5=NOTICE 6=INFO
+# Uvicorn writes everything to stdout so journald tags all lines as PRIORITY=6.
+# We rely on the inner structlog `level` field instead — accept up to INFO (6)
+# and let the inner JSON filter decide what's an error.
+_MAX_PRIORITY = 6
 
 
 class JournalWatcher:
