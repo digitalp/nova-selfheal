@@ -121,11 +121,11 @@ async def run(settings: Settings) -> None:
         while True:
             error: NovaError = await queue.get()
 
-            _LOGGER.info("selfheal.error_received", event=error.event, exc_type=error.exc_type)
+            _LOGGER.info("selfheal.error_received", log_event=error.event, exc_type=error.exc_type)
 
             # Respect pause state
             if _paused[0]:
-                _LOGGER.info("selfheal.paused_skipping", event=error.event)
+                _LOGGER.info("selfheal.paused_skipping", log_event=error.event)
                 continue
 
             events.record(
@@ -137,7 +137,7 @@ async def run(settings: Settings) -> None:
 
             # Deduplicate
             if dedup.is_duplicate(error):
-                _LOGGER.info("selfheal.deduplicated", event=error.event)
+                _LOGGER.info("selfheal.deduplicated", log_event=error.event)
                 events.record(EVT_DEDUPLICATED, log_event=error.event, exc_type=error.exc_type)
                 continue
             dedup.record(error)
@@ -168,7 +168,7 @@ async def run(settings: Settings) -> None:
             diff = extract_diff(claude_output)
 
             if diff and not validate_diff(diff, settings.nova_path):
-                _LOGGER.warning("selfheal.unsafe_diff", event=error.event)
+                _LOGGER.warning("selfheal.unsafe_diff", log_event=error.event)
                 diff = None
 
             fix_id = str(uuid.uuid4())
@@ -194,7 +194,7 @@ async def run(settings: Settings) -> None:
                 )
                 await bot.send_fix_proposal(fix)
             else:
-                _LOGGER.info("selfheal.no_diff_analysis_only", event=error.event)
+                _LOGGER.info("selfheal.no_diff_analysis_only", log_event=error.event)
                 events.record(
                     EVT_ANALYSIS_ONLY,
                     fix_id=fix_id,
