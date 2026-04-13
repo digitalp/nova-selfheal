@@ -97,6 +97,86 @@ def create_app(
             content_type="application/json",
         ))
 
+    async def handle_config_update(request: web.Request) -> web.Response:
+        """Update writable settings in the .env file."""
+        try:
+            body = await request.json()
+        except Exception:
+            return _cors(web.Response(
+                status=400,
+                text=json.dumps({"error": "invalid JSON"}),
+                content_type="application/json",
+            ))
+
+        env_path = settings.model_config.get("env_file", "/opt/nova-selfheal/.env")
+        if callable(env_path):
+            env_path = "/opt/nova-selfheal/.env"
+
+        # Read existing .env
+        try:
+            with open(env_path, "r") as f:
+                lines = f.readlines()
+        except FileNotFoundError:
+            lines = []
+
+        # Allowed updatable keys (never expose secrets back, just update them)
+        UPDATABLE = {
+            "ANTHROPIC_API_KEY",
+            "APPROVAL_TIMEOUT_SECONDS",
+            "DEDUP_WINDOW_SECONDS",
+            "CLAUDE_TIMEOUT_SECONDS",
+            "LOG_LEVEL",
+            "API_PORT",
+        }
+
+        updates: dict[str, str] = {}
+        for key, val in body.items():
+            k = key.upper()
+            if k in UPDATABLE:
+                updates[k] = str(val).strip()
+
+        if not updates:
+            return _cors(web.Response(
+                status=400,
+                text=json.dumps({"error": "no updatable keys provided"}),
+                content_type="application/json",
+            ))
+
+        # Replace existing keys or append new ones
+        existing_keys = set()
+        new_lines = []
+        for line in lines:
+            stripped = line.strip()
+            if "=" in stripped and not stripped.startswith("#"):
+                k = stripped.split("=", 1)[0].strip().upper()
+                if k in updates:
+                    new_lines.append(f"{k}={updates[k]}\n")
+                    existing_keys.add(k)
+                    continue
+            new_lines.append(line)
+
+        for k, v in updates.items():
+            if k not in existing_keys:
+                new_lines.append(f"{k}={v}\n")
+
+        try:
+            with open(env_path, "w") as f:
+                f.writelines(new_lines)
+            import os
+            os.chmod(env_path, 0o600)
+        except Exception as exc:
+            return _cors(web.Response(
+                status=500,
+                text=json.dumps({"error": f"failed to write .env: {repr(exc)}"}),
+                content_type="application/json",
+            ))
+
+        _LOGGER.info("api_server.config_updated", keys=list(updates.keys()))
+        return _cors(web.Response(
+            text=json.dumps({"ok": True, "updated": list(updates.keys()), "restart_required": True}),
+            content_type="application/json",
+        ))
+
     async def handle_approve(request: web.Request) -> web.Response:
         fix_id = request.match_info["fix_id"]
         if fix_id not in pending_fixes:
@@ -138,6 +218,7 @@ def create_app(
     app.router.add_get("/events", handle_events)
     app.router.add_get("/pending", handle_pending)
     app.router.add_get("/config", handle_config)
+    app.router.add_post("/config", handle_config_update)
     app.router.add_post("/pending/{fix_id}/approve", handle_approve)
     app.router.add_post("/pending/{fix_id}/reject", handle_reject)
     app.router.add_route("OPTIONS", "/{path_info:.*}", handle_options)
