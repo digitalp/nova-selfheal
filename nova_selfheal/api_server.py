@@ -91,6 +91,8 @@ def create_app(
             "log_level": settings.log_level,
             "telegram_bot_token": masked_token,
             "telegram_chat_id": settings.telegram_chat_id,
+            "openai_api_key": "***" if settings.openai_api_key else "",
+            "openai_model": settings.openai_model,
         }
         return _cors(web.Response(
             text=json.dumps(data),
@@ -122,6 +124,8 @@ def create_app(
         # Allowed updatable keys (never expose secrets back, just update them)
         UPDATABLE = {
             "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "OPENAI_MODEL",
             "APPROVAL_TIMEOUT_SECONDS",
             "DEDUP_WINDOW_SECONDS",
             "CLAUDE_TIMEOUT_SECONDS",

@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     api_host: str = "0.0.0.0"
     api_port: int = 7779
 
+    # ── OpenAI fallback ───────────────────────────────────────────────────────
+    # If set, used as fallback when Claude CLI fails (API quota, auth errors)
+    openai_api_key: str = ""
+    openai_model: str = "gpt-4o"
+
     # ── Logging ───────────────────────────────────────────────────────────────
     log_level: str = "INFO"
 
