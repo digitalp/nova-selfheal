@@ -21,6 +21,7 @@ from nova_selfheal.event_store import (
 from nova_selfheal.models import NovaError, PendingFix
 from nova_selfheal.patch_applier import PatchApplier
 from nova_selfheal.patch_extractor import extract_diff, extract_summary, validate_diff
+from nova_selfheal.health_checker import BackendHealthChecker
 from nova_selfheal.telegram_bot import TelegramApprovalBot
 from nova_selfheal.watcher import JournalWatcher
 
@@ -108,12 +109,20 @@ async def run(settings: Settings) -> None:
         set_paused=lambda v: _paused.__setitem__(0, v),
     )
     watcher = JournalWatcher(settings.watch_service, queue, settings)
+    health = BackendHealthChecker(
+        settings=settings,
+        error_queue=queue,
+        events=events,
+        bot=bot,
+        get_paused=lambda: _paused[0],
+    )
 
     api_app = create_app(settings, events, _pending_fixes, on_approve, on_reject)
     api = ApiServer(api_app, host=settings.api_host, port=settings.api_port)
 
     await bot.start()
     await watcher.start()
+    await health.start()
     await api.start()
     _LOGGER.info("selfheal.started", service=settings.watch_service, api_port=settings.api_port)
 
@@ -209,6 +218,7 @@ async def run(settings: Settings) -> None:
         _LOGGER.info("selfheal.stopping")
     finally:
         await api.stop()
+        await health.stop()
         await watcher.stop()
         await bot.stop()
         dedup.close()
