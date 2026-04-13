@@ -49,7 +49,7 @@ class ClaudeAgent:
             "--output-format", "text",
         ]
 
-        _LOGGER.info("claude_agent.invoking", event=error.event, timeout=self._timeout)
+        _LOGGER.info("claude_agent.invoking", log_event=error.event, timeout=self._timeout)
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -84,5 +84,5 @@ class ClaudeAgent:
                             returncode=proc.returncode, stderr=err_text)
 
         output = stdout.decode("utf-8", "replace").strip()
-        _LOGGER.info("claude_agent.done", chars=len(output), event=error.event)
+        _LOGGER.info("claude_agent.done", chars=len(output), log_event=error.event)
         return output

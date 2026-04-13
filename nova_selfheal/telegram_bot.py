@@ -150,7 +150,7 @@ class TelegramApprovalBot:
             )
 
         fix.telegram_message_id = msg.message_id  # type: ignore[attr-defined]
-        _LOGGER.info("telegram_bot.proposal_sent", fix_id=fix_id, event=fix.error.event)
+        _LOGGER.info("telegram_bot.proposal_sent", fix_id=fix_id, log_event=fix.error.event)
 
     async def send_analysis_only(self, error: "NovaError", summary: str) -> None:
         """Notify user of an error where no valid diff was produced."""
@@ -352,7 +352,7 @@ class TelegramApprovalBot:
         for fix_id in expired:
             fix = self._pending.pop(fix_id, None)
             if fix:
-                _LOGGER.info("telegram_bot.auto_rejected", fix_id=fix_id, event=fix.error.event)
+                _LOGGER.info("telegram_bot.auto_rejected", fix_id=fix_id, log_event=fix.error.event)
                 await self._on_reject(fix_id, auto=True)
                 assert self._app
                 await self._app.bot.send_message(
