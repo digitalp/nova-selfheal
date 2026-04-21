@@ -5,6 +5,7 @@ import tempfile
 import uuid
 from pathlib import Path
 
+import aiohttp
 import structlog
 
 _LOGGER = structlog.get_logger(__name__)
@@ -128,3 +129,71 @@ class PatchApplier:
             return False, "systemctl restart timed out after 30s"
         except Exception as exc:
             return False, f"restart error: {repr(exc)}"
+
+    async def verify_service(self, mode: str = "basic") -> tuple[bool, str]:
+        """Verify service health after a patch/restart."""
+        if mode == "websocket_container":
+            return await self._verify_websocket_container()
+        return await self._verify_basic()
+
+    async def _verify_basic(self) -> tuple[bool, str]:
+        url = "http://127.0.0.1:8001/health/live"
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as session:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        return True, "/health/live returned HTTP 200."
+                    return False, f"/health/live returned HTTP {resp.status}"
+        except Exception as exc:
+            return False, f"/health/live probe failed: {repr(exc)}"
+
+    async def _verify_websocket_container(self) -> tuple[bool, str]:
+        live_ok, live_msg = await self._verify_basic()
+        if not live_ok:
+            return False, live_msg
+
+        api_key = self._read_nova_env("API_KEY")
+        if not api_key:
+            return False, "Could not read API_KEY from Nova .env for websocket verification."
+
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+                async with session.get("http://127.0.0.1:8001/health/ready") as resp:
+                    if resp.status != 200:
+                        return False, f"/health/ready returned HTTP {resp.status}"
+
+                async with session.post(
+                    "http://127.0.0.1:8001/ws/token",
+                    headers={"X-API-Key": api_key},
+                ) as resp:
+                    if resp.status != 200:
+                        return False, f"/ws/token returned HTTP {resp.status}"
+                    token_payload = await resp.json()
+
+                token = str(token_payload.get("token") or "").strip()
+                if not token:
+                    return False, "/ws/token did not return a websocket token."
+
+                async with session.ws_connect(f"http://127.0.0.1:8001/ws/avatar?token={token}") as ws:
+                    msg = await ws.receive_json(timeout=5)
+                    if msg.get("type") != "avatar_state":
+                        return False, f"/ws/avatar returned unexpected payload: {msg!r}"
+
+            return True, "/health/live, /health/ready, /ws/token, and /ws/avatar all succeeded."
+        except Exception as exc:
+            return False, f"websocket verification failed: {repr(exc)}"
+
+    def _read_nova_env(self, key: str) -> str:
+        env_path = self._nova_path / ".env"
+        if not env_path.exists():
+            return ""
+        try:
+            for line in env_path.read_text(encoding="utf-8").splitlines():
+                if not line or line.lstrip().startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                if k.strip() == key:
+                    return v.strip()
+        except Exception:
+            return ""
+        return ""

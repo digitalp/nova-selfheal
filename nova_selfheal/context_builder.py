@@ -1,5 +1,6 @@
 from __future__ import annotations
 from pathlib import Path
+import re
 from typing import TYPE_CHECKING
 
 import structlog
@@ -49,6 +50,18 @@ class ContextBuilder:
 
         return candidate
 
+    def resolve_source(self, error: "NovaError") -> Path | None:
+        """Resolve source from logger first, then fall back to traceback file paths."""
+        source = self.resolve_source_file(error.logger)
+        if source is not None:
+            return source
+
+        for match in re.finditer(r'File "([^"]+)"', error.raw_json):
+            candidate = Path(match.group(1)).resolve()
+            if self._is_safe(candidate) and candidate.exists():
+                return candidate
+        return None
+
     def _is_safe(self, path: Path) -> bool:
         """Return True iff path is inside the allowed avatar_backend root."""
         try:
@@ -57,7 +70,7 @@ class ContextBuilder:
         except ValueError:
             return False
 
-    def build_prompt_context(self, error: "NovaError", source_file: Path) -> str:
+    def build_prompt_context(self, error: "NovaError", source_file: Path, aggregate_stats: str = "") -> str:
         """Read source file and return a formatted context string for the Claude prompt."""
         try:
             source_content = source_file.read_text(encoding="utf-8")
@@ -67,13 +80,18 @@ class ContextBuilder:
 
         rel_path = source_file.relative_to(self._nova_path)
 
-        return (
+        ctx = (
             f"ERROR DETAILS:\n"
             f"- Event:     {error.event}\n"
             f"- Exception: {error.exc_type}: {error.exc_value}\n"
             f"- Logger:    {error.logger}\n"
             f"- Timestamp: {error.timestamp}\n"
-            f"- Service:   {error.service}\n\n"
-            f"SOURCE FILE: {rel_path}\n"
+            f"- Service:   {error.service}\n"
+        )
+        if aggregate_stats:
+            ctx += f"\n{aggregate_stats}\n"
+        ctx += (
+            f"\nSOURCE FILE: {rel_path}\n"
             f"```python\n{source_content}\n```"
         )
+        return ctx

@@ -37,6 +37,7 @@ class PendingFix:
     diff: str               # unified diff text (may be empty if Claude produced analysis only)
     summary: str            # one-paragraph plain-English summary from Claude
     created_at: float       # time.monotonic() for timeout tracking
+    verification_mode: str = "basic"
     telegram_message_id: Optional[int] = None
     has_diff: bool = field(init=False)
 

@@ -16,13 +16,15 @@ from nova_selfheal.event_store import (
     EVT_ERROR_DETECTED, EVT_DEDUPLICATED, EVT_NO_SOURCE, EVT_CLAUDE_FAILED,
     EVT_FIX_PROPOSED, EVT_ANALYSIS_ONLY, EVT_APPROVED, EVT_REJECTED,
     EVT_AUTO_REJECTED, EVT_APPLY_OK, EVT_APPLY_FAILED,
-    EVT_RESTART_OK, EVT_RESTART_FAILED,
+    EVT_RESTART_OK, EVT_RESTART_FAILED, EVT_VERIFY_OK, EVT_VERIFY_FAILED,
 )
+from nova_selfheal.known_fixes import propose_known_fix
 from nova_selfheal.models import NovaError, PendingFix
 from nova_selfheal.patch_applier import PatchApplier
 from nova_selfheal.patch_extractor import extract_diff, extract_summary, validate_diff
 from nova_selfheal.health_checker import BackendHealthChecker
 from nova_selfheal.telegram_bot import TelegramApprovalBot
+from nova_selfheal.log_aggregator import LogAggregator
 from nova_selfheal.watcher import JournalWatcher
 
 _LOGGER = structlog.get_logger(__name__)
@@ -56,6 +58,7 @@ async def run(settings: Settings) -> None:
     dedup.setup()
 
     events = EventStore(settings.db_path.parent / "heal_events.db")
+    aggregator = LogAggregator()
 
     builder = ContextBuilder(settings.nova_path)
     agent = ClaudeAgent(settings.claude_work_dir, settings)
@@ -81,8 +84,15 @@ async def run(settings: Settings) -> None:
             restart_ok, restart_msg = await applier.restart_service()
             evt = EVT_RESTART_OK if restart_ok else EVT_RESTART_FAILED
             events.record(evt, fix_id=fix_id, service=settings.watch_service, message=restart_msg)
-            full_msg = f"Patch applied.\n{restart_msg}"
-            await bot.send_result(fix_id, restart_ok, full_msg)
+            if restart_ok:
+                verify_ok, verify_msg = await applier.verify_service(fix.verification_mode)
+                verify_evt = EVT_VERIFY_OK if verify_ok else EVT_VERIFY_FAILED
+                events.record(verify_evt, fix_id=fix_id, service=settings.watch_service, message=verify_msg)
+                full_msg = f"Patch applied.\n{restart_msg}\n{verify_msg}"
+                await bot.send_result(fix_id, verify_ok, full_msg)
+            else:
+                full_msg = f"Patch applied.\n{restart_msg}"
+                await bot.send_result(fix_id, False, full_msg)
         else:
             events.record(EVT_APPLY_FAILED, fix_id=fix_id, log_event=fix.error.event, message=msg)
             await bot.send_result(fix_id, False, msg)
@@ -132,10 +142,20 @@ async def run(settings: Settings) -> None:
 
             _LOGGER.info("selfheal.error_received", log_event=error.event, exc_type=error.exc_type)
 
+            # Always record in aggregator for stats (even if paused/deduped)
+            aggregator.record(error)
+
             # Respect pause state
             if _paused[0]:
                 _LOGGER.info("selfheal.paused_skipping", log_event=error.event)
                 continue
+
+            # Warnings: only process if they've become a recurring pattern
+            if error.level == "warning":
+                if not aggregator.should_escalate_warning(error):
+                    continue
+                _LOGGER.info("selfheal.warning_escalated", log_event=error.event,
+                             count=aggregator.get_stats(error).total_count)
 
             events.record(
                 EVT_ERROR_DETECTED,
@@ -152,7 +172,7 @@ async def run(settings: Settings) -> None:
             dedup.record(error)
 
             # Resolve source file
-            source_file = builder.resolve_source_file(error.logger)
+            source_file = builder.resolve_source(error)
             if source_file is None:
                 _LOGGER.warning("selfheal.no_source_file", logger=error.logger)
                 events.record(EVT_NO_SOURCE, log_event=error.event, message=error.logger)
@@ -162,8 +182,47 @@ async def run(settings: Settings) -> None:
                 )
                 continue
 
+            known_fix = propose_known_fix(error, source_file)
+            if known_fix is not None:
+                fix_id = str(uuid.uuid4())
+                fix = PendingFix(
+                    fix_id=fix_id,
+                    error=error,
+                    source_file=str(source_file.relative_to(settings.nova_path)),
+                    diff=known_fix.diff,
+                    summary=known_fix.summary,
+                    created_at=time.monotonic(),
+                    verification_mode=known_fix.verification_mode,
+                )
+                _pending_fixes[fix_id] = fix
+                if fix.has_diff:
+                    events.record(
+                        EVT_FIX_PROPOSED,
+                        fix_id=fix_id,
+                        log_event=error.event,
+                        exc_type=error.exc_type,
+                        source_file=fix.source_file,
+                        summary=known_fix.summary,
+                        diff=known_fix.diff,
+                        message="deterministic known-fix",
+                    )
+                    await bot.send_fix_proposal(fix)
+                else:
+                    events.record(
+                        EVT_ANALYSIS_ONLY,
+                        fix_id=fix_id,
+                        log_event=error.event,
+                        exc_type=error.exc_type,
+                        source_file=fix.source_file,
+                        summary=known_fix.summary,
+                        message="known-fix already present",
+                    )
+                    await bot.send_analysis_only(error, known_fix.summary)
+                continue
+
             # Build context and invoke Claude
-            error_context = builder.build_prompt_context(error, source_file)
+            stats = aggregator.get_stats(error)
+            error_context = builder.build_prompt_context(error, source_file, stats.format_for_prompt())
             try:
                 claude_output = await agent.generate_fix(error, error_context)
             except RuntimeError as exc:
@@ -188,6 +247,7 @@ async def run(settings: Settings) -> None:
                 diff=diff or "",
                 summary=summary,
                 created_at=time.monotonic(),
+                verification_mode="basic",
             )
             _pending_fixes[fix_id] = fix
 

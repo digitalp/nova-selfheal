@@ -6,6 +6,8 @@ Watches the Nova systemd service journal for `ERROR`-level log entries, invokes 
 
 **Zero modifications to Nova's source code required.**
 
+Known regressions can also be handled deterministically without going through Claude first. For example, websocket failures caused by a `get_container()` dependency signature mismatch are recognized directly from plain uvicorn traceback lines, mapped to `avatar_backend/bootstrap/container.py`, and verified after restart with `/ws/token` + `/ws/avatar`.
+
 ---
 
 ## How It Works

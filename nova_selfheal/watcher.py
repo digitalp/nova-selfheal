@@ -2,10 +2,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from typing import TYPE_CHECKING
 
 import structlog
 
+from nova_selfheal.known_fixes import match_known_error
 from nova_selfheal.models import NovaError
 
 if TYPE_CHECKING:
@@ -33,6 +35,7 @@ class JournalWatcher:
         self._settings = settings
         self._task: asyncio.Task | None = None
         self._proc: asyncio.subprocess.Process | None = None
+        self._traceback_lines: list[str] = []
 
     async def start(self) -> None:
         self._task = asyncio.create_task(self._watch_loop(), name="journal_watcher")
@@ -106,15 +109,20 @@ class JournalWatcher:
         if not message_raw:
             return None
 
+        return self._parse_message(
+            message_raw,
+            timestamp=str(outer.get("__REALTIME_TIMESTAMP", "")),
+        )
+
+    def _parse_message(self, message_raw: str, *, timestamp: str) -> NovaError | None:
         # MESSAGE may be a plain string or structlog JSON
         try:
             inner = json.loads(message_raw)
         except (json.JSONDecodeError, TypeError):
-            # Plain text message — not a structlog entry; skip
-            return None
+            return self._parse_plain_text(message_raw, timestamp=timestamp)
 
         level = str(inner.get("level", "")).lower()
-        if level not in ("error", "critical"):
+        if level not in ("error", "critical", "warning"):
             return None
 
         event = str(inner.get("event", "unknown"))
@@ -140,4 +148,74 @@ class JournalWatcher:
             service=self._service,
             level=level,
             raw_json=message_raw,
+        )
+
+    def _parse_plain_text(self, message_raw: str, *, timestamp: str) -> NovaError | None:
+        message = str(message_raw or "").rstrip()
+        if not message:
+            return None
+
+        if self._traceback_lines:
+            self._traceback_lines.append(message)
+            if self._is_traceback_terminal(message):
+                block = "\n".join(self._traceback_lines)
+                self._traceback_lines = []
+                return self._build_traceback_error(block, timestamp=timestamp)
+            return None
+
+        if message.startswith("Traceback (most recent call last):"):
+            self._traceback_lines = [message]
+            return None
+
+        return match_known_error(message, service=self._service)
+
+    @staticmethod
+    def _is_traceback_terminal(message: str) -> bool:
+        stripped = message.strip()
+        if not stripped or stripped.startswith("File "):
+            return False
+        return bool(
+            re.match(r"^[A-Za-z_][\w.]*?(Error|Exception|Warning)(?:: .*)?$", stripped)
+            or re.match(r"^[A-Za-z_][\w.]*: .+$", stripped)
+        )
+
+    def _build_traceback_error(self, block: str, *, timestamp: str) -> NovaError | None:
+        known = match_known_error(block, service=self._service)
+        if known is not None:
+            if timestamp:
+                known.timestamp = timestamp
+            return known
+
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+        if not lines:
+            return None
+
+        exc_line = lines[-1]
+        if ":" in exc_line:
+            exc_type, exc_value = exc_line.split(":", 1)
+            exc_value = exc_value.strip()
+        else:
+            exc_type, exc_value = exc_line, ""
+        exc_type = exc_type.strip() or "TracebackError"
+
+        logger = "unknown.traceback"
+        for match in re.finditer(r'File "([^"]+)"', block):
+            file_path = Path(match.group(1))
+            try:
+                rel = file_path.resolve().relative_to(self._settings.nova_path.resolve())
+            except Exception:
+                continue
+            if rel.suffix == ".py":
+                logger = ".".join(rel.with_suffix("").parts)
+
+        event = f"plain_traceback.{exc_type.lower().replace('.', '_')}"
+        return NovaError(
+            timestamp=timestamp,
+            event=event,
+            exc_type=exc_type,
+            exc_value=exc_value,
+            logger=logger,
+            service=self._service,
+            level="error",
+            raw_json=block,
         )

@@ -42,6 +42,10 @@ EVT_APPLY_OK        = "apply_ok"
 EVT_APPLY_FAILED    = "apply_failed"
 EVT_RESTART_OK      = "restart_ok"
 EVT_RESTART_FAILED  = "restart_failed"
+EVT_AUTO_RESTART    = "auto_restart"          # health-checker initiated restart
+EVT_HEALTH_DOWN     = "health_check_failed"   # /health confirmed unreachable
+EVT_VERIFY_OK       = "verify_ok"
+EVT_VERIFY_FAILED   = "verify_failed"
 
 
 class EventStore:
@@ -119,3 +123,8 @@ class EventStore:
             "patches_applied": applied,
             "fixes_rejected": rejected,
         }
+
+    def clear_all(self) -> int:
+        with self._conn() as conn:
+            cur = conn.execute("DELETE FROM heal_events")
+            return cur.rowcount
