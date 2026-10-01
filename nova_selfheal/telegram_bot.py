@@ -179,6 +179,20 @@ class TelegramApprovalBot:
             parse_mode=ParseMode.MARKDOWN_V2,
         )
 
+    async def send_notification(self, text: str) -> None:
+        """Send a plain MarkdownV2 notification (no approval buttons).
+        Used by the health checker for status alerts."""
+        if not self._app:
+            return
+        try:
+            await self._app.bot.send_message(
+                chat_id=self._settings.telegram_chat_id,
+                text=text,
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+        except Exception as exc:
+            _LOGGER.warning("telegram_bot.send_notification_failed", exc=repr(exc))
+
     # ── Command handlers ──────────────────────────────────────────────────────
 
     async def _cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -315,7 +329,12 @@ class TelegramApprovalBot:
 
     async def _handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
-        if not query or not query.data:
+        if (
+            not query
+            or not query.data
+            or not query.message
+            or query.message.chat_id != self._settings.telegram_chat_id
+        ):
             return
         await query.answer()
 
